@@ -44,7 +44,7 @@ pub type IRoaringBitmap = Interned<HashableRoaringBitmap>;
 /// A wrapper around `RoaringBitmap` that implements `Hash` and `Eq`
 /// based on content, enabling interning — using fast FxHash and iteration.
 /// Hash is computed on every call — no caching, no OnceLock.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[repr(transparent)]
 pub struct HashableRoaringBitmap(RoaringBitmap);
 

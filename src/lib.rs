@@ -148,6 +148,13 @@ impl<T: Internable + ?Sized> Clone for Interned<T> {
     }
 }
 
+impl<T: Default + Internable> Default for Interned<T> {
+    #[inline]
+    fn default() -> Self {
+        T::intern(T::default())
+    }
+}
+
 impl<T: Internable + ?Sized> Deref for Interned<T> {
     type Target = T;
 
