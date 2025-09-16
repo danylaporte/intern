@@ -104,6 +104,14 @@ impl<T: Internable + ?Sized> Interned<T> {
         &self.0
     }
 
+    #[inline]
+    pub fn cloned(&self) -> T
+    where
+        T: Clone,
+    {
+        Clone::clone(&*self.0)
+    }
+
     /// Returns `true` if both values point to the same underlying `Arc<T>`.
     ///
     /// Faster than `==` since it compares pointers directly — ideal for hot paths.
@@ -118,7 +126,7 @@ impl<T: Internable + ?Sized> Interned<T> {
 
     /// Clone the inner value into an owned `U`.
     #[inline]
-    pub fn into<U>(&self) -> U
+    pub fn into_inner<U>(&self) -> U
     where
         U: for<'a> From<&'a T>,
     {
