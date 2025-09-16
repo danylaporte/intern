@@ -1,19 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use intern::{Internable, Interned, Interner};
+use intern::Interned;
 use lasso::{Spur, ThreadedRodeo};
 use std::{hint::black_box, thread};
-
-// === Your Interner ===
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct Sym(&'static str);
-
-static SYM_INTERNER: Interner<Sym> = Interner::new();
-
-impl Internable for Sym {
-    fn interner() -> &'static Interner<Self> {
-        &SYM_INTERNER
-    }
-}
 
 // === Lasso Interner ===
 // lasso@0.7: ThreadedRustHen was renamed to RustHen
@@ -130,8 +118,8 @@ fn intern_benchmark(c: &mut Criterion) {
     c.bench_function("intern/first_10k", |b| {
         b.iter(|| {
             for s in &workload[..10_000] {
-                let interned = Sym(*s).intern();
-                let _str = &*interned; // ← already have it!
+                let interned = Interned::<str>::from(*s);
+                let _str = &*interned.as_inner(); // ← already have it!
                 black_box(_str);
             }
         })
@@ -151,13 +139,10 @@ fn intern_benchmark(c: &mut Criterion) {
     // --- Repeated lookups (hot path) ---
     // For your crate: we can do ptr_eq
     c.bench_function("intern/lookup_100k", |b| {
-        let _interns: Vec<Interned<Sym>> = workload[..10_000]
-            .iter()
-            .map(|&s| Sym(s).intern())
-            .collect();
+        let _interns: Vec<Interned<str>> = workload[..10_000].iter().map(|&s| s.into()).collect();
         b.iter(|| {
             for &s in &workload {
-                let _interned = Sym(s).intern(); // hits cache
+                let _interned = Interned::<str>::from(s); // hits cache
                 black_box(_interned);
             }
         })
@@ -188,7 +173,7 @@ fn intern_benchmark(c: &mut Criterion) {
                     let w = workload.clone();
                     thread::spawn(move || {
                         for &s in &w[..10_000] {
-                            black_box(Sym(s).intern());
+                            black_box(Interned::<str>::from(s));
                         }
                     })
                 })
@@ -225,7 +210,7 @@ fn memory_comparison(c: &mut Criterion) {
 
     c.bench_function("intern/memory_usage", |b| {
         b.iter(|| {
-            let _interns: Vec<_> = workload.iter().map(|&s| Sym(s).intern()).collect();
+            let _interns: Vec<_> = workload.iter().map(|&s| Interned::<str>::from(s)).collect();
             black_box(_interns);
         })
     });

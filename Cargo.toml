@@ -12,11 +12,9 @@ harness = false
 [dependencies]
 hashbrown = "0.16"
 parking_lot = "0.12"
+roaring = { version = "0.11", optional = true }
 rustc-hash = "2.1"
-serde_crate = { version = "1", optional = true, package = "serde" }
-
-[features]
-serde = ["serde_crate"]
+serde = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = "0.7"
