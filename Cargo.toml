@@ -1,0 +1,23 @@
+[package]
+name = "intern"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bench]]
+name = "intern_bench"
+harness = false
+
+[dependencies]
+hashbrown = "0.16"
+parking_lot = "0.12"
+rustc-hash = "2.1"
+serde_crate = { version = "1", optional = true, package = "serde" }
+
+[features]
+serde = ["serde_crate"]
+
+[dev-dependencies]
+criterion = "0.7"
+lasso = { version = "0.7", features = ["multi-threaded"] }
