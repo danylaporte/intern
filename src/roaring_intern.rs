@@ -195,6 +195,13 @@ impl PartialEq<RoaringBitmap> for Interned<HashableRoaringBitmap> {
     }
 }
 
+impl PartialEq<Interned<HashableRoaringBitmap>> for RoaringBitmap {
+    #[inline]
+    fn eq(&self, other: &Interned<HashableRoaringBitmap>) -> bool {
+        self == &other.0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
