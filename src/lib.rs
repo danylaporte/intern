@@ -8,12 +8,12 @@ pub use roaring_intern::{HashableRoaringBitmap, IRoaringBitmap};
 use rustc_hash::{FxBuildHasher, FxHasher};
 use std::{
     borrow::{Borrow, Cow},
+    fmt::{self, Debug, Display, Formatter},
     hash::{Hash, Hasher},
     ops::Deref,
-    rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering::Relaxed},
     },
 };
 
@@ -47,18 +47,11 @@ struct HashShard {
 ///     }
 /// }
 ///
-/// let a = Symbol("hello").intern();
-/// let b = Symbol("hello").intern();
+/// let a = Interned::new(Symbol("hello"));
+/// let b = Interned::new(Symbol("hello"));
 /// assert!(a.ptr_eq(&b)); // Same underlying Arc!
 /// ```
 pub trait Internable: Eq + Hash + 'static {
-    fn intern(self) -> Interned<Self>
-    where
-        Self: Sized,
-    {
-        Self::interner().intern(hash_shard(&self), Arc::new(self))
-    }
-
     /// The global interner used to deduplicate instances of this type.
     fn interner() -> &'static Interner<Self>;
 }
@@ -68,13 +61,6 @@ impl Internable for str {
     fn interner() -> &'static Interner<Self> {
         static INTERNER: Interner<str> = Interner::new();
         &INTERNER
-    }
-}
-
-impl From<String> for Interned<str> {
-    #[inline]
-    fn from(value: String) -> Self {
-        str::interner().intern(hash_shard(&*value), Arc::from(value))
     }
 }
 
@@ -95,10 +81,30 @@ impl From<String> for Interned<str> {
 /// let b = Interned::from("hello".to_string());
 /// assert!(a.ptr_eq(&b)); // true
 /// ```
-#[derive(Debug)]
 pub struct Interned<T: Internable + ?Sized>(Arc<T>);
 
 impl<T: Internable + ?Sized> Interned<T> {
+    pub fn new(value: T) -> Self
+    where
+        T: Sized,
+    {
+        let interner = T::interner();
+        let hash = hash_val(&value);
+        let idx = (hash as usize) & (SHARDS - 1);
+        let mut shard = interner.shards[idx].lock();
+
+        match shard.raw_entry_mut().from_hash(hash, |v| **v == value) {
+            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
+            RawEntryMut::Vacant(e) => {
+                let key = Arc::<T>::from(value);
+
+                e.insert_hashed_nocheck(hash, key.clone(), ());
+                interner.len.fetch_add(1, Relaxed);
+                Interned(key)
+            }
+        }
+    }
+
     #[inline]
     pub fn as_inner(&self) -> &T {
         &self.0
@@ -115,22 +121,12 @@ impl<T: Internable + ?Sized> Interned<T> {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+}
 
-    /// Clone the inner value into an owned `U`.
+impl<T: Internable + ?Sized> AsRef<T> for Interned<T> {
     #[inline]
-    pub fn into_inner<U>(&self) -> U
-    where
-        U: for<'a> From<&'a T>,
-    {
-        U::from(&**self)
-    }
-
-    #[inline]
-    pub fn to_owned(&self) -> T::Owned
-    where
-        T: ToOwned,
-    {
-        ToOwned::to_owned(&*self.0)
+    fn as_ref(&self) -> &T {
+        &self.0
     }
 }
 
@@ -148,10 +144,17 @@ impl<T: Internable + ?Sized> Clone for Interned<T> {
     }
 }
 
+impl<T: Debug + Internable + ?Sized> Debug for Interned<T> {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&**self, f)
+    }
+}
+
 impl<T: Default + Internable> Default for Interned<T> {
     #[inline]
     fn default() -> Self {
-        T::intern(T::default())
+        Self::from(T::default())
     }
 }
 
@@ -172,52 +175,37 @@ impl<T: Internable + ?Sized> Drop for Interned<T> {
     }
 }
 
-impl<T: Internable + ?Sized> Eq for Interned<T> {}
-
-impl<'a, T: Internable + ?Sized> From<&'a T> for Interned<T>
-where
-    Arc<T>: From<&'a T>,
-{
-    fn from(value: &'a T) -> Self {
-        let hash_shard = hash_shard(value);
-        let interner = T::interner();
-
-        // fast-path: O(1) atomic bump only
-        match interner.get(hash_shard, value) {
-            Some(v) => v,
-            None => {
-                // cold path: one alloc + copy, then intern
-                interner.intern(hash_shard, Arc::from(value))
-            }
-        }
+impl<T: Display + Internable + ?Sized> Display for Interned<T> {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&**self, f)
     }
 }
 
-impl<T: Internable + ?Sized> From<Arc<T>> for Interned<T>
-where
-    Arc<T>: for<'a> From<&'a T>,
-{
+impl<T: Internable + ?Sized> Eq for Interned<T> {}
+
+impl<T: Internable> From<T> for Interned<T> {
     #[inline]
-    fn from(value: Arc<T>) -> Self {
-        // Do not reuse the Arc here, use only the content of the Arc
-        // Reusing the Arc cause a memory leak inside the Interner cause the
-        // strong_count may not reach 2, so the drop won't remove it
-        T::interner().intern(hash_shard(&*value), Arc::from(&*value))
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
 impl<T: Internable + ?Sized> From<Box<T>> for Interned<T> {
-    #[inline]
     fn from(value: Box<T>) -> Self {
-        let hash_shard = hash_shard(&value);
         let interner = T::interner();
+        let hash = hash_val(&value);
+        let idx = (hash as usize) & (SHARDS - 1);
+        let mut shard = interner.shards[idx].lock();
 
-        // fast-path: O(1) atomic bump only
-        match interner.get(hash_shard, &*value) {
-            Some(v) => v,
-            None => {
-                // cold path: one alloc + copy, then intern
-                interner.intern(hash_shard, Arc::from(value))
+        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
+            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
+            RawEntryMut::Vacant(e) => {
+                let key = Arc::<T>::from(value);
+
+                e.insert_hashed_nocheck(hash, key.clone(), ());
+                interner.len.fetch_add(1, Relaxed);
+                Interned(key)
             }
         }
     }
@@ -225,60 +213,57 @@ impl<T: Internable + ?Sized> From<Box<T>> for Interned<T> {
 
 impl<'a, T> From<Cow<'a, T>> for Interned<T>
 where
-    Arc<T>: From<&'a T>,
-    Interned<T>: From<T::Owned>,
     T: Internable + ToOwned + ?Sized,
+    Interned<T>: From<&'a T> + From<T::Owned>,
 {
     #[inline]
     fn from(value: Cow<'a, T>) -> Self {
         match value {
-            Cow::Borrowed(s) => s.into(),
-            Cow::Owned(s) => s.into(),
+            Cow::Borrowed(s) => Self::from(s),
+            Cow::Owned(s) => Self::from(s),
         }
     }
 }
 
-impl<T> From<Rc<T>> for Interned<T>
-where
-    T: Internable + ?Sized,
-    Arc<T>: for<'a> From<&'a T>,
-{
+impl From<&str> for Interned<str> {
     #[inline]
-    fn from(value: Rc<T>) -> Self {
-        Self::from(&*value)
+    fn from(value: &str) -> Self {
+        let interner = str::interner();
+        let hash = hash_val(&value);
+        let idx = (hash as usize) & (SHARDS - 1);
+        let mut shard = interner.shards[idx].lock();
+
+        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
+            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
+            RawEntryMut::Vacant(e) => {
+                let key = Arc::<str>::from(value);
+
+                e.insert_hashed_nocheck(hash, key.clone(), ());
+                interner.len.fetch_add(1, Relaxed);
+                Interned(key)
+            }
+        }
     }
 }
 
-impl<'a, T> From<&'a Arc<T>> for Interned<T>
-where
-    T: Internable + ?Sized,
-    Arc<T>: From<&'a T>,
-{
+impl From<String> for Interned<str> {
     #[inline]
-    fn from(value: &'a Arc<T>) -> Self {
-        Self::from(&**value)
-    }
-}
+    fn from(value: String) -> Self {
+        let interner = str::interner();
+        let hash = hash_val(&value);
+        let idx = (hash as usize) & (SHARDS - 1);
+        let mut shard = interner.shards[idx].lock();
 
-impl<'a, T> From<&'a Box<T>> for Interned<T>
-where
-    T: Internable + ?Sized,
-    Arc<T>: From<&'a T>,
-{
-    #[inline]
-    fn from(value: &'a Box<T>) -> Self {
-        Interned::from(&**value)
-    }
-}
+        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
+            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
+            RawEntryMut::Vacant(e) => {
+                let key = Arc::<str>::from(value);
 
-impl<'a, T> From<&'a Rc<T>> for Interned<T>
-where
-    T: Clone + Internable,
-    Arc<T>: From<&'a T>,
-{
-    #[inline]
-    fn from(value: &'a Rc<T>) -> Self {
-        Interned::from(&**value)
+                e.insert_hashed_nocheck(hash, key.clone(), ());
+                interner.len.fetch_add(1, Relaxed);
+                Interned(key)
+            }
+        }
     }
 }
 
@@ -306,14 +291,16 @@ impl<T: Internable + ?Sized> PartialEq<T> for Interned<T> {
 #[cfg(feature = "serde")]
 impl<'de, T> serde::Deserialize<'de> for Interned<T>
 where
-    T: for<'b> serde::Deserialize<'b> + Internable,
+    T: ?Sized + Internable + ToOwned,
+    for<'a> Cow<'a, T>: serde::Deserialize<'de>,
+    Interned<T>: From<Cow<'de, T>>,
 {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        T::deserialize(deserializer).map(Internable::intern)
+        Cow::<'de, T>::deserialize(deserializer).map(Interned::from)
     }
 }
 
@@ -367,46 +354,6 @@ impl<T: ?Sized + Internable> Interner<T> {
         }
     }
 
-    #[inline]
-    fn get<Q>(&self, hash_shard: HashShard, q: &Q) -> Option<Interned<T>>
-    where
-        Arc<T>: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let shard = self.shards[hash_shard.idx].lock();
-
-        shard
-            .raw_entry()
-            .from_key_hashed_nocheck(hash_shard.hash, q)
-            .map(|(arc, _)| Interned(arc.clone()))
-    }
-
-    /// Interns a value, returning a shared handle (`Interned<T>`).
-    ///
-    /// If an equal value already exists, returns its existing handle.
-    /// Otherwise, stores the new value and returns a new handle.
-    ///
-    /// Uses raw-entry API for single atomic lookup-and-insert.
-    ///
-    /// # Performance
-    /// Average-case O(1). Lock held only briefly during insertion.
-    #[must_use]
-    fn intern(&self, hash_shard: HashShard, value: Arc<T>) -> Interned<T> {
-        let mut map = self.shards[hash_shard.idx].lock();
-
-        match map
-            .raw_entry_mut()
-            .from_key_hashed_nocheck(hash_shard.hash, &value)
-        {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                e.insert_hashed_nocheck(hash_shard.hash, value.clone(), ());
-                self.len.fetch_add(1, Ordering::Relaxed);
-                Interned(value)
-            }
-        }
-    }
-
     /// Internal: Removes an interned value if it's no longer referenced elsewhere.
     ///
     /// Called automatically when `Interned<T>` is dropped and no other references exist.
@@ -431,7 +378,7 @@ impl<T: ?Sized + Internable> Interner<T> {
                 .from_key_hashed_nocheck(hash_shard.hash, &item.0)
             {
                 o.remove();
-                self.len.fetch_sub(1, Ordering::Relaxed);
+                self.len.fetch_sub(1, Relaxed);
             }
         }
     }
@@ -451,14 +398,14 @@ impl<T: ?Sized + Internable> Interner<T> {
     /// assert_eq!(interner.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed) as usize
+        self.len.load(Relaxed) as usize
     }
 
     /// Returns `true` if no values are currently interned.
     ///
     /// Equivalent to `len() == 0`.
     pub fn is_empty(&self) -> bool {
-        self.len.load(Ordering::Relaxed) == 0
+        self.len.load(Relaxed) == 0
     }
 }
 
@@ -506,33 +453,11 @@ const fn make_shards<T: ?Sized + Internable>() -> [Shard<T>; SHARDS] {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct Sym(&'static str);
-
-    static SYM_INTERNER: Interner<Sym> = Interner::new();
-
-    impl Internable for Sym {
-        fn interner() -> &'static Interner<Self> {
-            &SYM_INTERNER
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct Sym2(u32);
-
-    static SYM2_INTERNER: Interner<Sym2> = Interner::new();
-
-    impl Internable for Sym2 {
-        fn interner() -> &'static Interner<Self> {
-            &SYM2_INTERNER
-        }
-    }
-
     #[test]
     fn deduplication() {
-        let a = Sym("hello").intern();
-        let b = Sym("hello").intern();
-        let c = Sym("world").intern();
+        let a = Interned::from("hello");
+        let b = Interned::from("hello");
+        let c = Interned::from("world");
 
         assert!(a.ptr_eq(&b));
         assert!(!a.ptr_eq(&c));
@@ -542,18 +467,28 @@ mod tests {
 
     #[test]
     fn deref_and_eq() {
-        let s = Sym("rust").intern();
-        assert_eq!(s.as_inner(), &Sym("rust"));
-        assert_eq!(s, Sym("rust"));
+        let s = Interned::from("rust");
+        assert_eq!(s.as_inner(), &*Interned::from("rust"));
+        assert_eq!(s, Interned::from("rust"));
     }
 
     #[test]
     fn len_and_is_empty() {
-        let interner = &SYM2_INTERNER;
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        struct Sym(&'static str);
+
+        impl Internable for Sym {
+            fn interner() -> &'static Interner<Self> {
+                static SYM_INTERNER: Interner<Sym> = Interner::new();
+                &SYM_INTERNER
+            }
+        }
+
+        let interner = Sym::interner();
         assert!(interner.is_empty());
-        let _a = Sym2(1).intern();
+        let _a = Interned::new(Sym("a"));
         assert_eq!(interner.len(), 1);
-        let _b = Sym2(2).intern();
+        let _b = Interned::new(Sym("b"));
         assert_eq!(interner.len(), 2);
         drop(_a);
         assert_eq!(interner.len(), 1);
@@ -563,8 +498,20 @@ mod tests {
     fn concurrent_intern() {
         use std::thread;
 
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        struct Sym(&'static str);
+
+        impl Internable for Sym {
+            fn interner() -> &'static Interner<Self> {
+                static SYM_INTERNER: Interner<Sym> = Interner::new();
+                &SYM_INTERNER
+            }
+        }
+
         let handles: Vec<_> = (0..100)
-            .map(|i| thread::spawn(move || Sym(if i % 2 == 0 { "even" } else { "odd" }).intern()))
+            .map(|i| {
+                thread::spawn(move || Interned::new(Sym(if i % 2 == 0 { "even" } else { "odd" })))
+            })
             .collect();
 
         let mut evens = 0;
@@ -584,9 +531,9 @@ mod tests {
     #[test]
     fn hash_and_pointer_identity() {
         use std::collections::hash_map::DefaultHasher;
-        let a = Sym("key").intern();
+        let a = Interned::from("key");
         let b = a.clone();
-        let c = Sym("key").intern();
+        let c = Interned::from("key");
 
         assert_eq!(a, b);
         assert_eq!(a, c);
@@ -597,5 +544,26 @@ mod tests {
         a.hash(&mut h1);
         c.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_interned_str_compiles() {
+        use serde::Deserialize;
+
+        // This ensures `Interned<str>` implements Deserialize — if not, this won't compile.
+        fn ensure_deserialize<T: for<'de> Deserialize<'de>>() {}
+
+        ensure_deserialize::<Interned<str>>();
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_interned_str_serialize_compiles() {
+        use serde::Serialize;
+
+        // Ensure Interned<str> implements Serialize — if not, this won't compile.
+        fn ensure_serialize<T: Serialize>() {}
+        ensure_serialize::<Interned<str>>();
     }
 }

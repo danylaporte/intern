@@ -3,11 +3,11 @@
 /// ```
 /// use std::collections::hash_map::DefaultHasher;
 /// use std::hash::{Hash, Hasher};
-/// use intern::{HashableRoaringBitmap, Interned};
+/// use intern::{IRoaringBitmap, Interned};
 ///
-/// let rb1 = HashableRoaringBitmap::from_iter([1, 2, 3]);
-/// let rb2 = HashableRoaringBitmap::from_iter([1, 2, 3]);
-/// let rb3 = HashableRoaringBitmap::from_iter([4, 5]);
+/// let rb1 = IRoaringBitmap::from_iter([1, 2, 3]);
+/// let rb2 = IRoaringBitmap::from_iter([1, 2, 3]);
+/// let rb3 = IRoaringBitmap::from_iter([4, 5]);
 ///
 /// // identical content ⇒ same hash
 /// assert_eq!(hash(&rb1), hash(&rb2));
@@ -31,11 +31,12 @@
 ///     hasher.finish()
 /// }
 /// ```
-use super::{Internable, Interned, Interner};
+use super::{Internable, Interned, Interner, SHARDS, hash_val};
+use hashbrown::hash_map::RawEntryMut;
 use roaring::RoaringBitmap;
 use std::{
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering::Relaxed},
 };
 
 /// An Interned RoaringBitmap.
@@ -49,11 +50,6 @@ pub type IRoaringBitmap = Interned<HashableRoaringBitmap>;
 pub struct HashableRoaringBitmap(RoaringBitmap);
 
 impl HashableRoaringBitmap {
-    #[inline]
-    pub fn new(bitmap: RoaringBitmap) -> Self {
-        Self(bitmap)
-    }
-
     #[inline]
     fn from_bitmap_ref(b: &RoaringBitmap) -> &Self {
         // safety: HashableRoaringBitmap is #[repr(transparent)] around RoaringBitmap
@@ -85,35 +81,6 @@ impl Hash for HashableRoaringBitmap {
     }
 }
 
-impl From<RoaringBitmap> for HashableRoaringBitmap {
-    #[inline]
-    fn from(bitmap: RoaringBitmap) -> Self {
-        Self::new(bitmap)
-    }
-}
-
-impl From<HashableRoaringBitmap> for RoaringBitmap {
-    #[inline]
-    fn from(wrapper: HashableRoaringBitmap) -> Self {
-        wrapper.0
-    }
-}
-
-/// Create a `HashableRoaringBitmap` from any iterator of `u32`.
-///
-/// # Example
-/// ```
-/// use intern::HashableRoaringBitmap;
-/// let rb = HashableRoaringBitmap::from_iter([1, 2, 3]);
-/// assert_eq!(rb.inner().len(), 3);
-/// ```
-impl FromIterator<u32> for HashableRoaringBitmap {
-    #[inline]
-    fn from_iter<I: IntoIterator<Item = u32>>(iter: I) -> Self {
-        Self(RoaringBitmap::from_iter(iter))
-    }
-}
-
 impl Internable for HashableRoaringBitmap {
     #[inline]
     fn interner() -> &'static Interner<Self> {
@@ -129,48 +96,51 @@ impl Interned<HashableRoaringBitmap> {
     }
 }
 
-impl From<HashableRoaringBitmap> for Interned<HashableRoaringBitmap> {
-    fn from(mut hb: HashableRoaringBitmap) -> Self {
-        let hash_shard = crate::hash_shard(&hb);
-        let interner = HashableRoaringBitmap::interner();
-
-        match interner.get(hash_shard, &hb) {
-            Some(interned) => interned,
-            None => {
-                hb.0.optimize();
-                interner.intern(hash_shard, Arc::new(hb))
-            }
-        }
-    }
-}
-
 impl From<RoaringBitmap> for Interned<HashableRoaringBitmap> {
     #[inline]
     fn from(bitmap: RoaringBitmap) -> Self {
-        HashableRoaringBitmap(bitmap).into()
-    }
-}
-
-impl From<&HashableRoaringBitmap> for Interned<HashableRoaringBitmap> {
-    fn from(hb: &HashableRoaringBitmap) -> Self {
-        let hash_shard = crate::hash_shard(hb);
         let interner = HashableRoaringBitmap::interner();
+        let mut value = HashableRoaringBitmap(bitmap);
+        let hash = hash_val(&value);
+        let idx = (hash as usize) & (SHARDS - 1);
+        let mut shard = interner.shards[idx].lock();
 
-        match interner.get(hash_shard, hb) {
-            Some(interned) => interned,
-            None => {
-                let mut hb = hb.clone();
-                hb.0.optimize();
-                interner.intern(hash_shard, Arc::new(hb))
+        match shard.raw_entry_mut().from_hash(hash, |v| **v == value) {
+            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
+            RawEntryMut::Vacant(e) => {
+                value.0.optimize();
+
+                let key = Arc::new(value);
+
+                e.insert_hashed_nocheck(hash, key.clone(), ());
+                interner.len.fetch_add(1, Relaxed);
+                Interned(key)
             }
         }
     }
 }
 
 impl From<&RoaringBitmap> for Interned<HashableRoaringBitmap> {
-    #[inline]
-    fn from(b: &RoaringBitmap) -> Self {
-        HashableRoaringBitmap::from_bitmap_ref(b).into()
+    fn from(bitmap: &RoaringBitmap) -> Self {
+        let interner = HashableRoaringBitmap::interner();
+        let value = HashableRoaringBitmap::from_bitmap_ref(bitmap);
+        let hash = hash_val(&value);
+        let idx = (hash as usize) & (SHARDS - 1);
+        let mut shard = interner.shards[idx].lock();
+
+        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
+            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
+            RawEntryMut::Vacant(e) => {
+                let mut value = value.clone();
+                value.0.optimize();
+
+                let key = Arc::new(value);
+
+                e.insert_hashed_nocheck(hash, key.clone(), ());
+                interner.len.fetch_add(1, Relaxed);
+                Interned(key)
+            }
+        }
     }
 }
 
@@ -185,6 +155,21 @@ impl<'a> From<&'a Interned<HashableRoaringBitmap>> for &'a RoaringBitmap {
     #[inline]
     fn from(v: &'a Interned<HashableRoaringBitmap>) -> Self {
         &v.0.0
+    }
+}
+
+/// Create a `HashableRoaringBitmap` from any iterator of `u32`.
+///
+/// # Example
+/// ```
+/// use intern::IRoaringBitmap;
+/// let rb = IRoaringBitmap::from_iter([1, 2, 3]);
+/// assert_eq!(rb.inner().len(), 3);
+/// ```
+impl FromIterator<u32> for Interned<HashableRoaringBitmap> {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = u32>>(iter: I) -> Self {
+        Self::from(RoaringBitmap::from_iter(iter))
     }
 }
 
@@ -210,7 +195,7 @@ mod tests {
 
     #[test]
     fn hash_deterministic() {
-        let rb = HashableRoaringBitmap::from_iter(0..1_000);
+        let rb = IRoaringBitmap::from_iter(0..1_000);
         let mut h1 = DefaultHasher::new();
         let mut h2 = DefaultHasher::new();
         rb.hash(&mut h1);
@@ -220,8 +205,8 @@ mod tests {
 
     #[test]
     fn intern_dedup() {
-        let a: IRoaringBitmap = HashableRoaringBitmap::from_iter(1..10).into();
-        let b: IRoaringBitmap = HashableRoaringBitmap::from_iter(1..10).into();
+        let a = IRoaringBitmap::from_iter(1..10);
+        let b = IRoaringBitmap::from_iter(1..10);
         assert!(a.ptr_eq(&b));
     }
 }
