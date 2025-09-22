@@ -1,6 +1,10 @@
+#[cfg(feature = "int_hashset")]
+mod hash_set_intern;
 #[cfg(feature = "roaring")]
 mod roaring_intern;
 
+#[cfg(feature = "int_hashset")]
+pub use hash_set_intern::{I32HashSet, II32HashSet, IU32HashSet, U32HashSet};
 use hashbrown::hash_map::{HashMap, RawEntryMut};
 use parking_lot::Mutex;
 #[cfg(feature = "roaring")]

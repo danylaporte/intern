@@ -269,6 +269,7 @@ dependencies = [
  "criterion",
  "hashbrown 0.16.0",
  "lasso",
+ "nohash",
  "parking_lot",
  "roaring",
  "rustc-hash",
@@ -337,6 +338,12 @@ name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
+
+[[package]]
+name = "nohash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0f889fb66f7acdf83442c35775764b51fed3c606ab9cee51500dbde2cf528ca"
 
 [[package]]
 name = "num-traits"
