@@ -4,6 +4,7 @@ use std::{
     collections::hash_set::HashSet,
     fmt::{self, Debug, Formatter},
     hash::{BuildHasher, Hash, Hasher, RandomState},
+    ops::{Deref, DerefMut},
     sync::{Arc, atomic::Ordering::Relaxed},
 };
 
@@ -49,6 +50,22 @@ impl<T: Debug + Eq + Hash, S: BuildHasher> Debug for HashableHashSet<T, S> {
 impl<T, S: Default> Default for HashableHashSet<T, S> {
     fn default() -> Self {
         Self(Default::default())
+    }
+}
+
+impl<T, S> Deref for HashableHashSet<T, S> {
+    type Target = HashSet<T, S>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, S> DerefMut for HashableHashSet<T, S> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
