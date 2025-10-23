@@ -11,7 +11,6 @@ harness = false
 
 [dependencies]
 hashbrown = "0.16"
-nohash = { version = "0.2", optional = true }
 parking_lot = "0.12"
 roaring = { version = "0.11", optional = true }
 rustc-hash = "2.1"
@@ -20,6 +19,3 @@ serde = { version = "1", optional = true }
 [dev-dependencies]
 criterion = "0.7"
 lasso = { version = "0.7", features = ["multi-threaded"] }
-
-[features]
-int_hashset = ["nohash"]

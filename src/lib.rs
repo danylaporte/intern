@@ -1,9 +1,7 @@
-#[cfg(feature = "int_hashset")]
 mod hash_set_intern;
 #[cfg(feature = "roaring")]
 mod roaring_intern;
 
-#[cfg(feature = "int_hashset")]
 pub use hash_set_intern::{I32HashSet, II32HashSet, IU32HashSet, U32HashSet};
 use hashbrown::hash_map::{HashMap, RawEntryMut};
 use parking_lot::Mutex;
@@ -376,10 +374,11 @@ impl<T: ?Sized + Internable> Interner<T> {
         //   - the one in the interner's map
         // Thus, it is safe to remove the map entry.
 
-        if Arc::strong_count(&item.0) == 2 {
-            if let RawEntryMut::Occupied(o) = map
+        if Arc::strong_count(&item.0) == 2
+            && let RawEntryMut::Occupied(o) = map
                 .raw_entry_mut()
                 .from_key_hashed_nocheck(hash_shard.hash, &item.0)
+        {
             {
                 o.remove();
                 self.len.fetch_sub(1, Relaxed);

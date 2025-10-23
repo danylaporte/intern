@@ -8,10 +8,10 @@ use std::{
     sync::{Arc, atomic::Ordering::Relaxed},
 };
 
-pub type I32HashSet = HashableHashSet<i32, nohash::BuildNoHashHasher<i32>>;
+pub type I32HashSet = HashableHashSet<i32, rustc_hash::FxBuildHasher>;
 pub type II32HashSet = Interned<I32HashSet>;
 pub type IU32HashSet = Interned<U32HashSet>;
-pub type U32HashSet = HashableHashSet<u32, nohash::BuildNoHashHasher<u32>>;
+pub type U32HashSet = HashableHashSet<u32, rustc_hash::FxBuildHasher>;
 
 /// A wrapper around `RoaringBitmap` that implements `Hash` and `Eq`
 /// based on content, enabling interning — using fast FxHash and iteration.
