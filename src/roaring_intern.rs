@@ -31,12 +31,11 @@
 ///     hasher.finish()
 /// }
 /// ```
-use super::{Internable, Interned, Interner, SHARDS, hash_val};
-use hashbrown::hash_map::RawEntryMut;
+use super::{Internable, Interned, Interner};
 use roaring::RoaringBitmap;
 use std::{
     hash::{Hash, Hasher},
-    sync::{Arc, atomic::Ordering::Relaxed},
+    sync::Arc,
 };
 
 /// An Interned RoaringBitmap.
@@ -99,48 +98,24 @@ impl Interned<HashableRoaringBitmap> {
 impl From<RoaringBitmap> for Interned<HashableRoaringBitmap> {
     #[inline]
     fn from(bitmap: RoaringBitmap) -> Self {
-        let interner = HashableRoaringBitmap::interner();
-        let mut value = HashableRoaringBitmap(bitmap);
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                value.0.optimize();
-
-                let key = Arc::new(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        HashableRoaringBitmap::interner().intern(HashableRoaringBitmap(bitmap), |mut v| {
+            v.0.optimize();
+            Arc::new(v)
+        })
     }
 }
 
 impl From<&RoaringBitmap> for Interned<HashableRoaringBitmap> {
+    #[inline]
     fn from(bitmap: &RoaringBitmap) -> Self {
-        let interner = HashableRoaringBitmap::interner();
-        let value = HashableRoaringBitmap::from_bitmap_ref(bitmap);
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let mut value = value.clone();
-                value.0.optimize();
-
-                let key = Arc::new(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        HashableRoaringBitmap::interner().intern(
+            HashableRoaringBitmap::from_bitmap_ref(bitmap),
+            |v| {
+                let mut v = v.clone();
+                v.0.optimize();
+                Arc::new(v)
+            },
+        )
     }
 }
 

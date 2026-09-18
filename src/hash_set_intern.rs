@@ -1,11 +1,10 @@
-use super::{Internable, Interned, Interner, SHARDS, hash_val};
-use hashbrown::hash_map::RawEntryMut;
+use super::{Internable, Interned, Interner};
 use std::{
     collections::hash_set::HashSet,
     fmt::{self, Debug, Formatter},
     hash::{BuildHasher, Hash, Hasher, RandomState},
     ops::{Deref, DerefMut},
-    sync::{Arc, atomic::Ordering::Relaxed},
+    sync::Arc,
 };
 
 pub type I32HashSet = HashableHashSet<i32, rustc_hash::FxBuildHasher>;
@@ -114,22 +113,7 @@ where
 {
     #[inline]
     fn from(set: HashSet<T, S>) -> Self {
-        let interner = HashableHashSet::interner();
-        let value = HashableHashSet(set);
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let key = Arc::new(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        HashableHashSet::interner().intern(HashableHashSet(set), Arc::new)
     }
 }
 
@@ -139,23 +123,11 @@ where
     S: BuildHasher + Clone,
     T: Clone + Eq + Hash,
 {
+    #[inline]
     fn from(set: &HashSet<T, S>) -> Self {
-        let interner = HashableHashSet::interner();
-        let value = HashableHashSet::from_hashset_ref(set);
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let key = Arc::new(value.clone());
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        HashableHashSet::interner().intern(HashableHashSet::from_hashset_ref(set), |v| {
+            Arc::new(v.clone())
+        })
     }
 }
 

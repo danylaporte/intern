@@ -10,12 +10,12 @@ name = "intern_bench"
 harness = false
 
 [dependencies]
-hashbrown = "0.16"
+hashbrown = "0.17.1"
 parking_lot = "0.12"
-roaring = { version = "0.11", optional = true }
-rustc-hash = "2.1"
+roaring = { version = "0.11.5", optional = true }
+rustc-hash = "2.1.3"
 serde = { version = "1", optional = true }
 
 [dev-dependencies]
-criterion = "0.7"
+criterion = { version = "0.8.2", default-features = false }
 lasso = { version = "0.7", features = ["multi-threaded"] }

@@ -3,27 +3,18 @@ mod hash_set_intern;
 mod roaring_intern;
 
 pub use hash_set_intern::{I32HashSet, II32HashSet, IU32HashSet, U32HashSet};
-use hashbrown::hash_map::{HashMap, RawEntryMut};
-use parking_lot::Mutex;
+use hashbrown::{HashTable, hash_table::Entry};
+use parking_lot::RwLock;
 #[cfg(feature = "roaring")]
 pub use roaring_intern::{HashableRoaringBitmap, IRoaringBitmap};
-use rustc_hash::{FxBuildHasher, FxHasher};
+use rustc_hash::FxHasher;
 use std::{
     borrow::{Borrow, Cow},
     fmt::{self, Debug, Display, Formatter},
     hash::{Hash, Hasher},
     ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering::Relaxed},
-    },
+    sync::Arc,
 };
-
-#[derive(Copy, Clone)]
-struct HashShard {
-    hash: u64,
-    idx: usize,
-}
 
 /// Types that can be interned for memory-efficient deduplication.
 ///
@@ -86,25 +77,12 @@ impl Internable for str {
 pub struct Interned<T: Internable + ?Sized>(Arc<T>);
 
 impl<T: Internable + ?Sized> Interned<T> {
+    #[inline]
     pub fn new(value: T) -> Self
     where
         T: Sized,
     {
-        let interner = T::interner();
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let key = Arc::<T>::from(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        T::interner().intern(value, Arc::new)
     }
 
     #[inline]
@@ -170,9 +148,11 @@ impl<T: Internable + ?Sized> Deref for Interned<T> {
 }
 
 impl<T: Internable + ?Sized> Drop for Interned<T> {
+    #[inline]
     fn drop(&mut self) {
+        // Fast path: someone else still holds a handle, nothing to clean up.
         if Arc::strong_count(&self.0) == 2 {
-            T::interner().remove_interned_if_possible(self);
+            T::interner().remove_if_unreferenced(&self.0);
         }
     }
 }
@@ -194,22 +174,9 @@ impl<T: Internable> From<T> for Interned<T> {
 }
 
 impl<T: Internable + ?Sized> From<Box<T>> for Interned<T> {
+    #[inline]
     fn from(value: Box<T>) -> Self {
-        let interner = T::interner();
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let key = Arc::<T>::from(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        T::interner().intern(value, Arc::from)
     }
 }
 
@@ -230,42 +197,14 @@ where
 impl From<&str> for Interned<str> {
     #[inline]
     fn from(value: &str) -> Self {
-        let interner = str::interner();
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let key = Arc::<str>::from(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        str::interner().intern(value, Arc::from)
     }
 }
 
 impl From<String> for Interned<str> {
     #[inline]
     fn from(value: String) -> Self {
-        let interner = str::interner();
-        let hash = hash_val(&value);
-        let idx = (hash as usize) & (SHARDS - 1);
-        let mut shard = interner.shards[idx].lock();
-
-        match shard.raw_entry_mut().from_hash(hash, |v| **v == *value) {
-            RawEntryMut::Occupied(e) => Interned(e.key().clone()),
-            RawEntryMut::Vacant(e) => {
-                let key = Arc::<str>::from(value);
-
-                e.insert_hashed_nocheck(hash, key.clone(), ());
-                interner.len.fetch_add(1, Relaxed);
-                Interned(key)
-            }
-        }
+        str::interner().intern(value, Arc::from)
     }
 }
 
@@ -320,8 +259,12 @@ where
     }
 }
 
-const SHARDS: usize = 16;
-type Shard<T> = Mutex<HashMap<Arc<T>, (), FxBuildHasher>>;
+const SHARD_BITS: u32 = 6;
+const SHARDS: usize = 1 << SHARD_BITS;
+
+/// One shard per cache line so neighbouring shards don't ping-pong under contention.
+#[repr(align(64))]
+struct Shard<T: ?Sized>(RwLock<HashTable<Arc<T>>>);
 
 /// A thread-safe interner that deduplicates values of type `T`.
 ///
@@ -330,7 +273,7 @@ type Shard<T> = Mutex<HashMap<Arc<T>, (), FxBuildHasher>>;
 ///
 /// # Performance
 /// - O(1) insert/lookup using `FxHasher`.
-/// - Lock-free reads; minimal lock contention during insertion.
+/// - Sharded; lookups of already-interned values only take a shared (read) lock.
 /// - Automatic garbage collection on drop.
 ///
 /// # Example
@@ -342,8 +285,6 @@ type Shard<T> = Mutex<HashMap<Arc<T>, (), FxBuildHasher>>;
 /// ```
 pub struct Interner<T: ?Sized + Internable> {
     shards: [Shard<T>; SHARDS],
-    /// cheap counter so that `len()` needs no locks
-    len: AtomicU64,
 }
 
 impl<T: ?Sized + Internable> Interner<T> {
@@ -351,44 +292,58 @@ impl<T: ?Sized + Internable> Interner<T> {
     #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self {
-            shards: make_shards(),
-            len: AtomicU64::new(0),
+            shards: [const { Shard(RwLock::new(HashTable::new())) }; SHARDS],
         }
     }
 
-    /// Internal: Removes an interned value if it's no longer referenced elsewhere.
+    /// Interns `value`, building the `Arc` with `make` only when it is not already present.
     ///
-    /// Called automatically when `Interned<T>` is dropped and no other references exist.
-    /// Not meant for direct use.
-    fn remove_interned_if_possible(&self, item: &Interned<T>)
-    where
-        T: Internable,
-    {
-        let hash_shard = hash_shard(&*item.0);
+    /// `V: Borrow<T>` lets owned (`String`, `Box<T>`, `T`) and borrowed (`&str`, `&T`)
+    /// inputs share one implementation without an up-front allocation or clone.
+    #[inline]
+    fn intern<V: Borrow<T>>(&self, value: V, make: impl FnOnce(V) -> Arc<T>) -> Interned<T> {
+        let (shard, hash) = self.locate(value.borrow());
 
-        let mut map = self.shards[hash_shard.idx].lock();
-
-        // After acquiring the lock, verify no other thread created a new reference.
-        // If strong_count == 2, then the only remaining references are:
-        //   - the one we're dropping (this Interned<T>)
-        //   - the one in the interner's map
-        // Thus, it is safe to remove the map entry.
-
-        if Arc::strong_count(&item.0) == 2
-            && let RawEntryMut::Occupied(o) = map
-                .raw_entry_mut()
-                .from_key_hashed_nocheck(hash_shard.hash, &item.0)
         {
-            {
-                o.remove();
-                self.len.fetch_sub(1, Relaxed);
+            let table = shard.read();
+            if let Some(arc) = table.find(hash, |arc| **arc == *value.borrow()) {
+                return Interned(arc.clone());
             }
         }
+
+        let mut table = shard.write();
+        match table.entry(hash, |arc| **arc == *value.borrow(), rehash) {
+            Entry::Occupied(e) => Interned(e.get().clone()),
+            Entry::Vacant(e) => Interned(e.insert(make(value)).get().clone()),
+        }
+    }
+
+    /// Removes `arc` from the interner if the caller's handle is the last one outside the map.
+    fn remove_if_unreferenced(&self, arc: &Arc<T>) {
+        let (shard, hash) = self.locate(arc);
+        let mut table = shard.write();
+
+        // Re-check under the lock: another thread may have interned the same value
+        // (bumping the count) between the caller's check and our acquiring the lock.
+        // At exactly 2 the only owners are the dropping handle and the map itself.
+        if Arc::strong_count(arc) == 2
+            && let Ok(e) = table.find_entry(hash, |v| Arc::ptr_eq(v, arc))
+        {
+            e.remove();
+        }
+    }
+
+    #[inline]
+    fn locate(&self, value: &T) -> (&RwLock<HashTable<Arc<T>>>, u64) {
+        let hash = hash_val(value);
+        let shard = &self.shards[(hash as usize) & (SHARDS - 1)].0;
+        (shard, hash >> SHARD_BITS)
     }
 
     /// Returns the number of distinct values currently interned.
     ///
     /// Only includes values still referenced by at least one `Interned<T>`.
+    /// Takes a read lock on every shard, so avoid calling it on hot paths.
     ///
     /// # Example
     /// ```
@@ -401,26 +356,22 @@ impl<T: ?Sized + Internable> Interner<T> {
     /// assert_eq!(interner.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
-        self.len.load(Relaxed) as usize
+        self.shards.iter().map(|s| s.0.read().len()).sum()
     }
 
     /// Returns `true` if no values are currently interned.
     ///
     /// Equivalent to `len() == 0`.
     pub fn is_empty(&self) -> bool {
-        self.len.load(Relaxed) == 0
+        self.shards.iter().all(|s| s.0.read().is_empty())
     }
 }
 
+/// Hash for the table itself: the low `SHARD_BITS` are already spent selecting the shard,
+/// so they are dropped to keep bucket indices uniformly distributed within a shard.
 #[inline]
-fn hash_shard<Q>(q: &Q) -> HashShard
-where
-    Q: Hash + ?Sized,
-{
-    let hash = hash_val(q);
-    let idx = (hash as usize) & (SHARDS - 1);
-
-    HashShard { hash, idx }
+fn rehash<T: Internable + ?Sized>(arc: &Arc<T>) -> u64 {
+    hash_val(&**arc) >> SHARD_BITS
 }
 
 #[inline]
@@ -428,28 +379,6 @@ fn hash_val<T: Hash + ?Sized>(value: &T) -> u64 {
     let mut hasher = FxHasher::default();
     value.hash(&mut hasher);
     hasher.finish()
-}
-
-#[inline]
-const fn make_shards<T: ?Sized + Internable>() -> [Shard<T>; SHARDS] {
-    [
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-    ]
 }
 
 #[cfg(test)]

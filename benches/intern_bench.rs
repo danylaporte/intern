@@ -115,24 +115,30 @@ fn intern_benchmark(c: &mut Criterion) {
     let workload = generate_workload();
 
     // --- First 10k internings ---
+    // Both sides start from an empty interner each iteration and keep every handle alive
+    // until the iteration ends (for `intern` that is what empties the global interner again).
     c.bench_function("intern/first_10k", |b| {
         b.iter(|| {
-            for s in &workload[..10_000] {
-                let interned = Interned::<str>::from(*s);
-                let _str = &*interned.as_inner(); // ← already have it!
-                black_box(_str);
+            let mut handles = Vec::with_capacity(10_000);
+            for &s in &workload[..10_000] {
+                let interned = Interned::<str>::from(s);
+                black_box(interned.as_inner());
+                handles.push(interned);
             }
+            black_box(handles);
         })
     });
 
     c.bench_function("lasso/first_10k_roundtrip", |b| {
-        let interner = LassoInterner::new();
         b.iter(|| {
+            let interner = LassoInterner::new();
+            let mut keys = Vec::with_capacity(10_000);
             for &s in &workload[..10_000] {
                 let key = interner.get_or_intern(s);
-                let resolved = interner.resolve(&key); // ← ADD THIS
-                black_box(resolved);
+                black_box(interner.resolve(&key));
+                keys.push(key);
             }
+            black_box((interner, keys));
         })
     });
 
@@ -165,41 +171,71 @@ fn intern_benchmark(c: &mut Criterion) {
         })
     });
 
-    // --- Concurrent Interning ---
+    // --- Concurrent interning into one shared interner, each thread keeping its handles ---
     c.bench_function("intern/concurrent_10k_threads", |b| {
         b.iter(|| {
-            let handles: Vec<_> = (0..10)
-                .map(|_| {
-                    let w = workload.clone();
-                    thread::spawn(move || {
-                        for &s in &w[..10_000] {
-                            black_box(Interned::<str>::from(s));
-                        }
-                    })
-                })
-                .collect();
-            for h in handles {
-                h.join().unwrap();
-            }
+            thread::scope(|scope| {
+                for _ in 0..10 {
+                    scope.spawn(|| {
+                        let handles: Vec<Interned<str>> =
+                            workload[..10_000].iter().map(|&s| s.into()).collect();
+                        black_box(handles);
+                    });
+                }
+            });
         })
     });
 
     c.bench_function("lasso/concurrent_10k_threads", |b| {
         b.iter(|| {
-            let handles: Vec<_> = (0..10)
-                .map(|_| {
-                    let w = workload.clone();
-                    thread::spawn(move || {
-                        let interner = LassoInterner::new();
-                        for &s in &w[..10_000] {
-                            black_box(interner.get_or_intern(s));
+            let interner = LassoInterner::new();
+            thread::scope(|scope| {
+                for _ in 0..10 {
+                    scope.spawn(|| {
+                        let keys: Vec<Spur> = workload[..10_000]
+                            .iter()
+                            .map(|&s| interner.get_or_intern(s))
+                            .collect();
+                        black_box(keys);
+                    });
+                }
+            });
+            black_box(interner);
+        })
+    });
+
+    // --- Concurrent lookups against one shared, pre-populated interner (read-heavy) ---
+    c.bench_function("intern/concurrent_lookup_100k", |b| {
+        let _keep_alive: Vec<Interned<str>> = TEST_STRINGS.iter().map(|&s| s.into()).collect();
+        b.iter(|| {
+            thread::scope(|scope| {
+                for _ in 0..10 {
+                    scope.spawn(|| {
+                        for &s in &workload {
+                            black_box(Interned::<str>::from(s));
                         }
-                    })
-                })
-                .collect();
-            for h in handles {
-                h.join().unwrap();
-            }
+                    });
+                }
+            });
+        })
+    });
+
+    c.bench_function("lasso/concurrent_lookup_100k", |b| {
+        let interner = LassoInterner::new();
+        for &s in TEST_STRINGS {
+            interner.get_or_intern(s);
+        }
+        b.iter(|| {
+            thread::scope(|scope| {
+                for _ in 0..10 {
+                    scope.spawn(|| {
+                        for &s in &workload {
+                            let key = interner.get_or_intern(s);
+                            black_box(interner.resolve(&key));
+                        }
+                    });
+                }
+            });
         })
     });
 }
