@@ -312,7 +312,7 @@ impl<T: ?Sized + Internable> Interner<T> {
         }
 
         let mut table = shard.write();
-        match table.entry(hash, |arc| **arc == *value.borrow(), rehash) {
+        match table.entry(hash, |arc| **arc == *value.borrow(), |arc| hash_val(&**arc)) {
             Entry::Occupied(e) => Interned(e.get().clone()),
             Entry::Vacant(e) => Interned(e.insert(make(value)).get().clone()),
         }
@@ -336,8 +336,9 @@ impl<T: ?Sized + Internable> Interner<T> {
     #[inline]
     fn locate(&self, value: &T) -> (&RwLock<HashTable<Arc<T>>>, u64) {
         let hash = hash_val(value);
-        let shard = &self.shards[(hash as usize) & (SHARDS - 1)].0;
-        (shard, hash >> SHARD_BITS)
+        // Shard on the bits just below hashbrown's 7-bit tag so neither the tag nor the bucket index loses entropy.
+        let shard = &self.shards[((hash << 7) >> (64 - SHARD_BITS)) as usize].0;
+        (shard, hash)
     }
 
     /// Returns the number of distinct values currently interned.
@@ -365,13 +366,6 @@ impl<T: ?Sized + Internable> Interner<T> {
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.0.read().is_empty())
     }
-}
-
-/// Hash for the table itself: the low `SHARD_BITS` are already spent selecting the shard,
-/// so they are dropped to keep bucket indices uniformly distributed within a shard.
-#[inline]
-fn rehash<T: Internable + ?Sized>(arc: &Arc<T>) -> u64 {
-    hash_val(&**arc) >> SHARD_BITS
 }
 
 #[inline]

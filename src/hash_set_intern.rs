@@ -79,12 +79,25 @@ impl<T: Eq + Hash, S: BuildHasher> Eq for HashableHashSet<T, S> {}
 
 impl<T: Eq + Hash, S: BuildHasher> Hash for HashableHashSet<T, S> {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // Iteration order depends on insertion history and capacity, so combine commutatively.
+        let combined = self.0.iter().fold(0u64, |acc, val| {
+            let mut h = rustc_hash::FxHasher::default();
+            val.hash(&mut h);
+            acc.wrapping_add(fmix64(h.finish()))
+        });
         self.0.len().hash(state);
-
-        for val in self.0.iter() {
-            val.hash(state);
-        }
+        combined.hash(state);
     }
+}
+
+/// MurmurHash3 finalizer; keeps the per-element sum from being near-linear in Fx output.
+#[inline]
+fn fmix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
 }
 
 impl Internable for U32HashSet {
@@ -217,6 +230,22 @@ mod tests {
     fn intern_dedup() {
         let a = IU32HashSet::from_iter(1..10);
         let b = IU32HashSet::from_iter(1..10);
+        assert!(a.ptr_eq(&b));
+    }
+
+    #[test]
+    fn intern_dedup_independent_of_iteration_order() {
+        let small: HashSet<u32, rustc_hash::FxBuildHasher> = (0..100).collect();
+        let mut big = HashSet::with_capacity_and_hasher(10_000, Default::default());
+        big.extend((0..10_000).rev());
+        big.retain(|&x| x < 100);
+        assert!(
+            small.iter().ne(big.iter()),
+            "test needs differing iteration orders"
+        );
+
+        let a = IU32HashSet::from(small);
+        let b = IU32HashSet::from(big);
         assert!(a.ptr_eq(&b));
     }
 
